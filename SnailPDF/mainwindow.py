@@ -1,5 +1,7 @@
 from typing import List, Dict, Optional, Any
 import pathlib
+import contextlib
+import enum
 
 import fitz
 from PIL import Image, ImageQt
@@ -9,87 +11,9 @@ from PySide2 import QtGui
 from PySide2 import QtCore
 from PySide2.QtCore import Qt
 
+from SnailPDF import pdfview
 
-class EmptyPage(fitz.Page):
-    def __init__(self):
-        pass
-
-    def bound(self):
-        return fitz.Rect(0, 0, 1, 1)
-
-    def __del__(self):
-        pass
-
-
-EMPTY_PAGE = EmptyPage()
 EMPTY_DOC = fitz.Document()
-
-
-def render_fitz_page(page: fitz.Page, zoom: float, pixel_ratio: float) -> QtGui.QPixmap:
-    scale_ratio = zoom * pixel_ratio
-    pix = page.getPixmap(matrix=fitz.Matrix(scale_ratio, scale_ratio))
-    mode = "RGBA" if pix.alpha else "RGB"
-    img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
-    img = ImageQt.ImageQt(img)
-    img.setDevicePixelRatio(pixel_ratio)
-    return img
-
-
-def centered_coord(
-    bound_size: QtCore.QSize, content_size: QtCore.QSize
-) -> QtCore.QPoint:
-    margin_size = (bound_size - content_size) / 2
-    x = margin_size.width()
-    y = margin_size.height()
-    return QtCore.QPoint(x, y)
-
-
-class PDFPageView(QtWidgets.QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.page: fitz.Page = EMPTY_PAGE
-        self.rerender_required: bool = False
-        self.zoom_level: float = 1.0
-
-    def set_zoom_level(self, value: float):
-        self.zoom_level = value
-        self.rerender_required = True
-
-    def set_page(self, page):
-        self.page = page
-        self.zoom_to_fit_page()
-        self.rerender_required = True
-
-    def zoom_to_fit_page(self):
-        page_width = self.page.bound().width
-        page_height = self.page.bound().height
-        bound_width = self.size().width()
-        bound_height = self.size().height()
-        if bound_height == 0 or bound_width == 0:
-            self.set_zoom_level(1.0)
-        else:
-            self.set_zoom_level(
-                min(bound_height / page_height, bound_width / page_width)
-            )
-
-    def resizeEvent(self, event: QtGui.QResizeEvent):  # Override
-        self.rerender_required = True
-
-    def paintEvent(self, event: QtGui.QPaintEvent):  # Override
-        painter = QtGui.QPainter()
-        painter.begin(self)
-        if event.rect().width() < 1 or event.rect().height() < 1:
-            pass
-        elif self.page is EMPTY_PAGE:
-            painter.fillRect(event.rect(), Qt.darkGray)
-        elif self.rerender_required:
-            painter.fillRect(event.rect(), Qt.black)
-            img = render_fitz_page(self.page, self.zoom_level, self.devicePixelRatio())
-            layout_size = img.size() / img.devicePixelRatio()
-            coordinate = centered_coord(event.rect().size(), layout_size)
-            painter.drawImage(coordinate, img)
-            self.rerender_required = False
-        painter.end()
 
 
 def set_horizontal_strech(widget: QtWidgets.QWidget, value: int):
@@ -114,9 +38,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.action_next_page_prev = QtWidgets.QAction("Next with Preview")
 
         # Widgets
-        self.pdf_view = PDFPageView()
+        self.pdf_view = pdfview.PDFPageView()
         self.toc_view = QtWidgets.QTreeWidget()
         self.sidebar = QtWidgets.QWidget()
+
+        self.auto_page_turn = False
 
         self.setup_ui()
         self.pdf_doc: fitz.Document = EMPTY_DOC
@@ -161,7 +87,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def setup_layouts(self):
         self.toc_view.setHeaderLabels(["Title", "Page"])
         self.toc_view.header().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-        self.toc_view.header().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        self.toc_view.header().setSectionResizeMode(
+            1, QtWidgets.QHeaderView.ResizeToContents
+        )
+
         layout = QtWidgets.QGridLayout()
         layout.addWidget(self.toc_view)
         self.sidebar.setLayout(layout)
@@ -180,9 +109,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.action_open.triggered.connect(self.load_file)
         self.action_toggle_sidebar.triggered.connect(self.toggle_sidebar)
         self.action_debug.triggered.connect(self.debug)
-        self.action_next_page.triggered.connect(lambda: self.goto_page(self.current_page + 1))
-        self.action_prev_page.triggered.connect(lambda: self.goto_page(self.current_page - 1))
-        self.toc_view.itemClicked.connect(lambda item, _ : self.goto_page(int(item.text(1)) - 1))
+        self.action_next_page.triggered.connect(
+            lambda: self.goto_page(self.current_page + 1)
+        )
+        self.action_prev_page.triggered.connect(
+            lambda: self.goto_page(self.current_page - 1)
+        )
+        self.action_next_page_prev.triggered.connect(self.next_page_with_preview)
+        self.toc_view.itemClicked.connect(
+            lambda item, _: self.goto_page(int(item.text(1)) - 1)
+        )
 
     def load_file(self):
         filename = pathlib.Path(QtWidgets.QFileDialog.getOpenFileName(self)[0])
@@ -192,6 +128,7 @@ class MainWindow(QtWidgets.QMainWindow):
             new_doc = fitz.Document(filename)
         except RuntimeError as err:
             print(f"Failed to open document [fitz] : {filename}")
+            return
 
         if new_doc is None:
             return
@@ -209,18 +146,15 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         toc = self.pdf_doc.getToC(simple=True)
         self.toc_view.clear()
-        parent_stack = [(0, self.toc_view.invisibleRootItem())]
+        parents = [self.toc_view.invisibleRootItem()]
         for lvl, title, page in toc:
-            prev_lvl, prev_item = parent_stack[-1]
-            print(f"lvl={lvl}, title={title}, page={page}, prev_lvl={prev_lvl}")
-            while lvl <= prev_lvl:
-                parent_stack.pop()
-                prev_lvl, prev_item = parent_stack[-1]
-
-            new_item = QtWidgets.QTreeWidgetItem(prev_item)
+            new_item = QtWidgets.QTreeWidgetItem(parents[lvl - 1])
             new_item.setText(0, title)
             new_item.setText(1, str(page))
-            parent_stack.append((lvl, new_item))
+            if lvl == len(parents):
+                parents.append(new_item)
+            else:
+                parents[lvl] = new_item
 
     def debug(self):
         self.pdf_view.set_page(self.pdf_doc.loadPage(0))
@@ -229,28 +163,21 @@ class MainWindow(QtWidgets.QMainWindow):
     def toggle_sidebar(self):
         self.sidebar.setVisible(not self.sidebar.isVisible())
 
-    def next_page(self):
-        if self.pdf_doc == EMPTY_DOC or self.current_page == self.pdf_doc.pageCount - 1:
+    def next_page_with_preview(self):
+        if self.current_page >= self.pdf_doc.pageCount - 1:
             return
-        self.current_page += 1
-        self.pdf_view.set_page(self.pdf_doc.loadPage(self.current_page))
-        self.pdf_view.update()
 
-    def prev_page(self):
-        if (
-            self.pdf_doc == EMPTY_DOC
-            and self.current_page == self.pdf_doc.pageCount - 1
-        ):
-            return
-        self.current_page += 1
-        self.pdf_view.set_page(self.pdf_doc.loadPage(self.current_page))
+        self.pdf_view.set_preview_page(self.pdf_doc.loadPage(self.current_page + 1))
+        self.auto_page_turn = True
         self.pdf_view.update()
+        QtCore.QTimer.singleShot(5000, lambda: self.goto_page(self.current_page + 1))
 
     def goto_page(self, page: int):
         if self.pdf_doc == EMPTY_DOC or page < 0 or page >= self.pdf_doc.pageCount:
             return
-        
+
         self.current_page = page
         self.pdf_view.set_page(self.pdf_doc.loadPage(page))
+        self.auto_page_turn = False
         self.pdf_view.update()
 
